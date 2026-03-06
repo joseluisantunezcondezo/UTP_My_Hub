@@ -84,6 +84,14 @@ ICON_PNG_BY_URL: Dict[str, str] = {
 
 ICON_PNG_SEARCH_DIRS: Tuple[str, ...] = ("", "assets", "static", "images", "icons")
 
+# Prefijos para iconos personalizados:
+# - "png:archivo.png"  -> carga un PNG existente en el repo (mismo folder o /assets, /static, /images, /icons)
+# - "b64png:<base64>"  -> PNG embebido en el JSON (ideal para Streamlit Cloud sin subir archivos al repo)
+ICON_FILE_PREFIX = "png:"
+ICON_B64_PREFIX = "b64png:"
+ICON_DATA_PREFIX = "data:image/png;base64,"
+MAX_ICON_BYTES = 250_000  # ~250 KB (mantiene el registro liviano y rápido)
+
 
 BASE_AREAS = [
     {"name": "Products Operations", "icon": "⚙️"},
@@ -202,8 +210,76 @@ def load_png_base64(filename: str) -> Optional[str]:
     return None
 
 
+def _extract_embedded_png_b64(icon_value: str) -> Optional[str]:
+    icon_value = (icon_value or "").strip()
+    if not icon_value:
+        return None
+    if icon_value.startswith(ICON_B64_PREFIX):
+        payload = icon_value[len(ICON_B64_PREFIX):].strip()
+        return payload or None
+    if icon_value.startswith(ICON_DATA_PREFIX):
+        payload = icon_value[len(ICON_DATA_PREFIX):].strip()
+        return payload or None
+    return None
+
+
+def _extract_file_png_name(icon_value: str) -> Optional[str]:
+    icon_value = (icon_value or "").strip()
+    if not icon_value:
+        return None
+    lower = icon_value.lower()
+    if lower.startswith(ICON_FILE_PREFIX):
+        payload = icon_value[len(ICON_FILE_PREFIX):].strip()
+        return payload or None
+    if lower.endswith(".png"):
+        return icon_value
+    return None
+
+
+def _icon_is_png(icon_value: str) -> bool:
+    return bool(_extract_embedded_png_b64(icon_value) or _extract_file_png_name(icon_value))
+
+
+def _icon_display_token(icon_value: str) -> str:
+    """Token corto para mostrar en selectbox (evita imprimir base64)."""
+    if _icon_is_png(icon_value):
+        return "🖼️"
+    return icon_value or DEFAULT_CUSTOM_ICON
+
+
+def validate_icon_value(icon_value: str) -> str:
+    """Normaliza/valida el campo icon del registro sin romper compatibilidad."""
+    icon_value = (icon_value or "").strip()
+    if not icon_value:
+        return DEFAULT_CUSTOM_ICON
+
+    b64 = _extract_embedded_png_b64(icon_value)
+    if b64:
+        # Limita tamaño aprox (base64 crece ~33%)
+        max_b64_len = int(MAX_ICON_BYTES * 4 / 3) + 32
+        if len(b64) > max_b64_len:
+            raise RegistryError(
+                f"El icono PNG es demasiado grande. Máx aprox: {MAX_ICON_BYTES//1000} KB (PNG)."
+            )
+        try:
+            base64.b64decode(b64, validate=True)
+        except Exception as exc:
+            raise RegistryError("El icono PNG embebido no es válido (base64 corrupto).") from exc
+        # Asegura prefijo canónico
+        return f"{ICON_B64_PREFIX}{b64}"
+
+    fname = _extract_file_png_name(icon_value)
+    if fname:
+        # Canoniza a png:archivo.png
+        return f"{ICON_FILE_PREFIX}{fname}"
+
+    # Emoji / texto
+    return icon_value
+
+
 def card_icon_markup(app: "AppCard") -> str:
     """Devuelve el HTML del ícono para la tarjeta: PNG (si aplica) o emoji."""
+    # 1) Íconos fijos por URL (las 4 apps principales)
     url_key = normalize_url_key(app.url)
     png_name = ICON_PNG_BY_URL.get(url_key)
     if png_name:
@@ -211,8 +287,26 @@ def card_icon_markup(app: "AppCard") -> str:
         if b64:
             alt = html.escape(app.title, quote=True)
             return f'<img class="hub-card-icon-img" src="data:image/png;base64,{b64}" alt="{alt}" />'
-    # Fallback (emoji / texto)
-    return html.escape(app.icon)
+
+    # 2) Ícono persistido (emoji / png del repo / png embebido)
+    icon_value = (app.icon or "").strip()
+
+    embedded_b64 = _extract_embedded_png_b64(icon_value)
+    if embedded_b64:
+        alt = html.escape(app.title, quote=True)
+        return f'<img class="hub-card-icon-img" src="data:image/png;base64,{embedded_b64}" alt="{alt}" />'
+
+    fname = _extract_file_png_name(icon_value)
+    if fname:
+        b64 = load_png_base64(fname)
+        if b64:
+            alt = html.escape(app.title, quote=True)
+            return f'<img class="hub-card-icon-img" src="data:image/png;base64,{b64}" alt="{alt}" />'
+        # Si el archivo no existe aún, no mostramos el texto "png:..."
+        return html.escape(DEFAULT_CUSTOM_ICON)
+
+    # 3) Fallback emoji/texto
+    return html.escape(icon_value or DEFAULT_CUSTOM_ICON)
 
 
 def appcard_to_record(app: AppCard) -> Dict[str, str]:
@@ -297,7 +391,10 @@ def app_exists_excluding(
 
 
 def format_registry_app_option(app: AppCard) -> str:
-    return f"{app.icon} {app.title} — {app.area}"
+    return f"{_icon_display_token(app.icon)} {app.title} — {app.area}"
+
+
+
 
 
 
@@ -1219,6 +1316,148 @@ def render_flash_messages() -> None:
     if error_message:
         st.error(error_message)
 
+def _icon_preview_bytes(icon_value: str) -> Optional[bytes]:
+    """Devuelve bytes PNG para previsualización (si aplica)."""
+    if not icon_value:
+        return None
+    embedded = _extract_embedded_png_b64(icon_value)
+    if embedded:
+        try:
+            return base64.b64decode(embedded)
+        except Exception:
+            return None
+    fname = _extract_file_png_name(icon_value)
+    if fname:
+        b64 = load_png_base64(fname)
+        if b64:
+            try:
+                return base64.b64decode(b64)
+            except Exception:
+                return None
+    return None
+
+
+def render_icon_picker_new(key_prefix: str = "new_app") -> str:
+    """Selector de icono para 'Nueva app' (emoji / PNG repo / subir PNG)."""
+    mode = st.radio(
+        "Icono",
+        ["Emoji", "PNG del repositorio", "Subir PNG"],
+        horizontal=True,
+        key=f"{key_prefix}_icon_mode",
+        help="Elige cómo se mostrará el ícono en la tarjeta.",
+    )
+
+    if mode == "Emoji":
+        return st.text_input(
+            "Icono (emoji)",
+            value=DEFAULT_CUSTOM_ICON,
+            key=f"{key_prefix}_icon_emoji",
+            help="Ej.: 🧩, 📚, 📈",
+        )
+
+    if mode == "PNG del repositorio":
+        fname = st.text_input(
+            "Icono (archivo PNG)",
+            placeholder="imagen_01.png",
+            key=f"{key_prefix}_icon_file",
+            help="Debe existir en el repo (mismo folder o /assets, /static, /images o /icons).",
+        )
+        fname = normalize_text(fname)
+        if fname:
+            preview = _icon_preview_bytes(f"{ICON_FILE_PREFIX}{fname}")
+            if preview:
+                st.image(preview, width=56)
+            else:
+                st.caption("No se encontró el PNG. Se mostrará el icono por defecto hasta que exista en el repo.")
+            return f"{ICON_FILE_PREFIX}{fname}"
+        return DEFAULT_CUSTOM_ICON
+
+    # Subir PNG (se guarda embebido en el JSON)
+    upload = st.file_uploader(
+        "Subir icono PNG",
+        type=["png"],
+        accept_multiple_files=False,
+        key=f"{key_prefix}_icon_upload",
+        help=f"Se guardará embebido en el registro (recomendado). Máx aprox: {MAX_ICON_BYTES//1000} KB.",
+    )
+    if upload is not None:
+        data = upload.getvalue() or b""
+        if not data:
+            return DEFAULT_CUSTOM_ICON
+        if len(data) > MAX_ICON_BYTES:
+            st.error(f"El PNG supera el máximo permitido ({MAX_ICON_BYTES//1000} KB). Reduce el tamaño y vuelve a subirlo.")
+            return DEFAULT_CUSTOM_ICON
+        st.image(data, width=56)
+        b64 = base64.b64encode(data).decode("utf-8")
+        return f"{ICON_B64_PREFIX}{b64}"
+
+    return DEFAULT_CUSTOM_ICON
+
+
+def render_icon_picker_edit(current_icon: str, key_prefix: str = "edit_app") -> str:
+    """Selector de icono para 'Editar app' (mantener / emoji / PNG repo / subir PNG)."""
+    mode = st.radio(
+        "Icono",
+        ["Mantener actual", "Emoji", "PNG del repositorio", "Subir PNG"],
+        horizontal=True,
+        key=f"{key_prefix}_icon_mode",
+    )
+
+    if mode == "Mantener actual":
+        preview = _icon_preview_bytes(current_icon)
+        if preview:
+            st.image(preview, width=56)
+        else:
+            st.caption(f"Actual: {_icon_display_token(current_icon)}")
+        return current_icon or DEFAULT_CUSTOM_ICON
+
+    if mode == "Emoji":
+        return st.text_input(
+            "Icono (emoji)",
+            value=(current_icon if not _icon_is_png(current_icon) else DEFAULT_CUSTOM_ICON),
+            key=f"{key_prefix}_icon_emoji",
+            help="Ej.: 🧩, 📚, 📈",
+        )
+
+    if mode == "PNG del repositorio":
+        fname = st.text_input(
+            "Icono (archivo PNG)",
+            placeholder="imagen_01.png",
+            key=f"{key_prefix}_icon_file",
+            help="Debe existir en el repo (mismo folder o /assets, /static, /images o /icons).",
+        )
+        fname = normalize_text(fname)
+        if fname:
+            preview = _icon_preview_bytes(f"{ICON_FILE_PREFIX}{fname}")
+            if preview:
+                st.image(preview, width=56)
+            else:
+                st.caption("No se encontró el PNG. Se mostrará el icono por defecto hasta que exista en el repo.")
+            return f"{ICON_FILE_PREFIX}{fname}"
+        return DEFAULT_CUSTOM_ICON
+
+    # Subir PNG (se guarda embebido en el JSON)
+    upload = st.file_uploader(
+        "Subir icono PNG",
+        type=["png"],
+        accept_multiple_files=False,
+        key=f"{key_prefix}_icon_upload",
+        help=f"Se guardará embebido en el registro. Máx aprox: {MAX_ICON_BYTES//1000} KB.",
+    )
+    if upload is not None:
+        data = upload.getvalue() or b""
+        if not data:
+            return DEFAULT_CUSTOM_ICON
+        if len(data) > MAX_ICON_BYTES:
+            st.error(f"El PNG supera el máximo permitido ({MAX_ICON_BYTES//1000} KB). Reduce el tamaño y vuelve a subirlo.")
+            return DEFAULT_CUSTOM_ICON
+        st.image(data, width=56)
+        b64 = base64.b64encode(data).decode("utf-8")
+        return f"{ICON_B64_PREFIX}{b64}"
+
+    return DEFAULT_CUSTOM_ICON
+
+
 def build_app_from_form(
     title: str,
     area: str,
@@ -1230,7 +1469,7 @@ def build_app_from_form(
     clean_area = normalize_text(area)
     clean_description = normalize_text(description)
     clean_url = normalize_text(url)
-    clean_icon = normalize_text(icon) or DEFAULT_CUSTOM_ICON
+    clean_icon = validate_icon_value(icon)
 
     if not all([clean_title, clean_area, clean_description, clean_url]):
         raise RegistryError("Completa todos los campos obligatorios del formulario.")
@@ -1286,16 +1525,17 @@ def persist_updated_app(
     st.session_state.flash_error = ""
     st.session_state.flash_success = f"La app '{updated_app.title}' fue actualizada correctamente en {backend.info.label}."
 
-
-
 def persist_deleted_app(backend: Any, app_to_delete: AppCard) -> None:
     backend.delete_app(app_to_delete.title, app_to_delete.url)
     st.session_state.flash_error = ""
     st.session_state.flash_success = f"La app '{app_to_delete.title}' fue eliminada correctamente de {backend.info.label}."
 
-
-
 def render_registry_edit_tab(backend: Any, all_apps: List[AppCard], registry_apps: List[AppCard]) -> None:
+    """Edición de apps registradas.
+
+    IMPORTANTE: No usamos st.form aquí, porque dentro de un form Streamlit no hace rerun por cada cambio
+    (solo al enviar). Eso impedía que el selector de ícono (radio) cambie dinámicamente.
+    """
     if not registry_apps:
         st.info("No hay apps registradas para editar. Las apps fijas del código no se editan desde este modal.")
         return
@@ -1308,36 +1548,50 @@ def render_registry_edit_tab(backend: Any, all_apps: List[AppCard], registry_app
     )
     selected_app = registry_apps[selected_index]
 
-    with st.form("form_edit_app_modal", clear_on_submit=False):
-        col1, col2 = st.columns(2)
-        with col1:
-            title = st.text_input("Nombre", value=selected_app.title)
-            area = st.text_input("Área", value=selected_app.area)
-            icon = st.text_input("Icono", value=selected_app.icon or DEFAULT_CUSTOM_ICON, help="Ej.: 🧩, 📚, 📈")
-        with col2:
-            url = st.text_input("URL", value=selected_app.url)
-            description = st.text_area("Descripción", value=selected_app.description, height=120)
+    # Keys únicas por app (evita que se mezclen valores al cambiar de selección)
+    key_suffix = f"{selected_index}_{slugify_key(selected_app.title)}"
 
-        action_col1, action_col2 = st.columns([1, 1])
-        submit = action_col1.form_submit_button("Guardar cambios", use_container_width=True, type="primary")
-        cancel = action_col2.form_submit_button("Cancelar", use_container_width=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        title = st.text_input("Nombre", value=selected_app.title, key=f"edit_title_{key_suffix}")
+        area = st.text_input("Área", value=selected_app.area, key=f"edit_area_{key_suffix}")
+        icon = render_icon_picker_edit(selected_app.icon, key_prefix=f"edit_icon_{key_suffix}")
+    with col2:
+        url = st.text_input("URL", value=selected_app.url, key=f"edit_url_{key_suffix}")
+        description = st.text_area(
+            "Descripción",
+            value=selected_app.description,
+            height=120,
+            key=f"edit_desc_{key_suffix}",
+        )
 
-        if cancel:
+    action_col1, action_col2 = st.columns([1, 1])
+    submit = action_col1.button(
+        "Guardar cambios",
+        use_container_width=True,
+        type="primary",
+        key=f"edit_submit_{key_suffix}",
+    )
+    cancel = action_col2.button(
+        "Cancelar",
+        use_container_width=True,
+        key=f"edit_cancel_{key_suffix}",
+    )
+
+    if cancel:
+        st.rerun()
+
+    if submit:
+        try:
+            persist_updated_app(backend, all_apps, selected_app, title, area, description, url, icon)
+        except DuplicateAppError as exc:
+            st.error(str(exc))
+        except RegistryError as exc:
+            st.error(str(exc))
+        except Exception as exc:
+            st.error(f"Ocurrió un error inesperado al editar la app: {exc}")
+        else:
             st.rerun()
-
-        if submit:
-            try:
-                persist_updated_app(backend, all_apps, selected_app, title, area, description, url, icon)
-            except DuplicateAppError as exc:
-                st.error(str(exc))
-            except RegistryError as exc:
-                st.error(str(exc))
-            except Exception as exc:
-                st.error(f"Ocurrió un error inesperado al editar la app: {exc}")
-            else:
-                st.rerun()
-
-
 
 def render_registry_delete_tab(backend: Any, registry_apps: List[AppCard]) -> None:
     if not registry_apps:
@@ -1394,34 +1648,40 @@ if DIALOG_DECORATOR is not None:
         tab_new, tab_edit, tab_delete = st.tabs(["Nueva app", "Editar app", "Eliminar app"])
 
         with tab_new:
-            with st.form("form_add_app_modal", clear_on_submit=False):
-                col1, col2 = st.columns(2)
-                with col1:
-                    title = st.text_input("Nombre", placeholder="Ej.: UTP Dashboard")
-                    area = st.text_input("Área", value=st.session_state.selected_area)
-                    icon = st.text_input("Icono", value=DEFAULT_CUSTOM_ICON, help="Ej.: 🧩, 📚, 📈")
-                with col2:
-                    url = st.text_input("URL", placeholder="https://...")
-                    description = st.text_area("Descripción", height=120, placeholder="Describe brevemente la app")
+            # No usamos st.form aquí para permitir que el selector de ícono (radio + uploader)
+            # cambie dinámicamente al hacer clic (en forms, Streamlit no hace rerun hasta enviar).
+            col1, col2 = st.columns(2)
+            with col1:
+                title = st.text_input("Nombre", placeholder="Ej.: UTP Dashboard", key="new_title")
+                area = st.text_input("Área", value=st.session_state.selected_area, key="new_area")
+                icon = render_icon_picker_new("new_app")
+            with col2:
+                url = st.text_input("URL", placeholder="https://...", key="new_url")
+                description = st.text_area(
+                    "Descripción",
+                    height=120,
+                    placeholder="Describe brevemente la app",
+                    key="new_description",
+                )
 
-                action_col1, action_col2 = st.columns([1, 1])
-                submit = action_col1.form_submit_button("Guardar app", use_container_width=True, type="primary")
-                cancel = action_col2.form_submit_button("Cancelar", use_container_width=True)
+            action_col1, action_col2 = st.columns([1, 1])
+            submit = action_col1.button("Guardar app", use_container_width=True, type="primary", key="new_submit")
+            cancel = action_col2.button("Cancelar", use_container_width=True, key="new_cancel")
 
-                if cancel:
+            if cancel:
+                st.rerun()
+
+            if submit:
+                try:
+                    persist_new_app(backend, all_apps, title, area, description, url, icon)
+                except DuplicateAppError as exc:
+                    st.error(str(exc))
+                except RegistryError as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    st.error(f"Ocurrió un error inesperado al registrar la app: {exc}")
+                else:
                     st.rerun()
-
-                if submit:
-                    try:
-                        persist_new_app(backend, all_apps, title, area, description, url, icon)
-                    except DuplicateAppError as exc:
-                        st.error(str(exc))
-                    except RegistryError as exc:
-                        st.error(str(exc))
-                    except Exception as exc:
-                        st.error(f"Ocurrió un error inesperado al registrar la app: {exc}")
-                    else:
-                        st.rerun()
 
         with tab_edit:
             render_registry_edit_tab(backend, all_apps, registry_apps)
@@ -1437,24 +1697,34 @@ else:
         tab_new, tab_edit, tab_delete = st.tabs(["Nueva app", "Editar app", "Eliminar app"])
 
         with tab_new:
-            with st.form("form_add_app_fallback", clear_on_submit=False):
-                col1, col2 = st.columns(2)
-                with col1:
-                    title = st.text_input("Nombre", placeholder="Ej.: UTP Dashboard")
-                    area = st.text_input("Área", value=st.session_state.selected_area)
-                    icon = st.text_input("Icono", value=DEFAULT_CUSTOM_ICON)
-                with col2:
-                    url = st.text_input("URL", placeholder="https://...")
-                    description = st.text_area("Descripción", height=120, placeholder="Describe brevemente la app")
+            col1, col2 = st.columns(2)
+            with col1:
+                title = st.text_input("Nombre", placeholder="Ej.: UTP Dashboard", key="new_title_fallback")
+                area = st.text_input("Área", value=st.session_state.selected_area, key="new_area_fallback")
+                icon = render_icon_picker_new("new_app_fallback")
+            with col2:
+                url = st.text_input("URL", placeholder="https://...", key="new_url_fallback")
+                description = st.text_area(
+                    "Descripción",
+                    height=120,
+                    placeholder="Describe brevemente la app",
+                    key="new_description_fallback",
+                )
 
-                submit = st.form_submit_button("Guardar app", type="primary")
-                if submit:
-                    try:
-                        persist_new_app(backend, all_apps, title, area, description, url, icon)
-                    except Exception as exc:
-                        st.error(str(exc))
-                    else:
-                        st.rerun()
+            action_col1, action_col2 = st.columns([1, 1])
+            submit = action_col1.button("Guardar app", type="primary", use_container_width=True, key="new_submit_fallback")
+            cancel = action_col2.button("Cancelar", use_container_width=True, key="new_cancel_fallback")
+
+            if cancel:
+                st.rerun()
+
+            if submit:
+                try:
+                    persist_new_app(backend, all_apps, title, area, description, url, icon)
+                except Exception as exc:
+                    st.error(str(exc))
+                else:
+                    st.rerun()
 
         with tab_edit:
             render_registry_edit_tab(backend, all_apps, registry_apps)
@@ -1498,3 +1768,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
