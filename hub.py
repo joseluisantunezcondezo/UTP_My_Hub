@@ -106,7 +106,7 @@ REGISTRY_FILENAME = "apps_registry.json"
 DEFAULT_CUSTOM_SOURCE = REGISTRY_FILENAME
 DEFAULT_CUSTOM_ICON = "🧩"
 DEFAULT_CUSTOM_AREA_ICON = "🗂️"
-DEFAULT_GITHUB_REGISTRY_PATH = "data/apps_registry.json"
+DEFAULT_GITHUB_REGISTRY_PATH = REGISTRY_FILENAME  # por defecto, usa el registro en la raiz del repo
 GITHUB_API_BASE = "https://api.github.com"
 GITHUB_API_VERSION = "2022-11-28"
 
@@ -201,9 +201,23 @@ else:
 
 @_cache_decorator
 def load_png_base64(filename: str) -> Optional[str]:
-    """Carga un PNG local y lo devuelve en base64 (o None si no existe)."""
+    """Carga un PNG local y lo devuelve en base64 (o None si no existe).
+
+    Soporta:
+    - "archivo.png" (busca en base_dir y en /assets, /static, /images, /icons)
+    - "icons/archivo.png" (ruta relativa dentro del repo)
+
+    Seguridad:
+    - Bloquea rutas absolutas y traversal (..)
+    """
     filename = normalize_text(filename)
     if not filename:
+        return None
+
+    # Normaliza separadores para rutas del tipo "icons/mi.png"
+    safe_name = filename.replace("\\", "/")
+    rel_path = Path(safe_name)
+    if rel_path.is_absolute() or ".." in rel_path.parts:
         return None
 
     try:
@@ -211,19 +225,24 @@ def load_png_base64(filename: str) -> Optional[str]:
     except NameError:
         base_dir = Path.cwd()
 
-    candidates = []
-    for rel in ICON_PNG_SEARCH_DIRS:
-        candidates.append(base_dir / rel / filename)
-    # Fallback adicional (por si el CWD difiere en despliegue)
-    for rel in ICON_PNG_SEARCH_DIRS:
-        candidates.append(Path.cwd() / rel / filename)
+    candidates: List[Path] = []
+
+    # Si el usuario ya envio una ruta (ej. icons/imagen.png), probamos directo.
+    if len(rel_path.parts) > 1:
+        candidates.extend([base_dir / rel_path, Path.cwd() / rel_path])
+    else:
+        for rel in ICON_PNG_SEARCH_DIRS:
+            candidates.append(base_dir / rel / safe_name)
+        # Fallback adicional (por si el CWD difiere en despliegue)
+        for rel in ICON_PNG_SEARCH_DIRS:
+            candidates.append(Path.cwd() / rel / safe_name)
 
     for path in candidates:
         try:
             if path.exists() and path.is_file():
                 return base64.b64encode(path.read_bytes()).decode("utf-8")
 
-            # Fallback: búsqueda case-insensitive en el directorio (útil en repos con nombres distintos en may/min).
+            # Fallback: busqueda case-insensitive en el directorio (util en repos con may/min distintos)
             parent = path.parent
             if parent.exists() and parent.is_dir():
                 target = path.name.lower()
@@ -235,7 +254,51 @@ def load_png_base64(filename: str) -> Optional[str]:
                         continue
         except Exception:
             continue
+
     return None
+
+
+@_cache_decorator
+def list_repo_png_files() -> List[str]:
+    """Lista PNG disponibles dentro del repo para el selector "PNG del repositorio".
+
+    Busca en el directorio de hub.py (y en CWD como fallback) dentro de:
+    - raiz
+    - /assets, /static, /images, /icons
+
+    Devuelve rutas relativas (p.ej. "imagen.png" o "icons/imagen.png").
+    """
+    files: List[str] = []
+    seen = set()
+
+    try:
+        base_dirs = [Path(__file__).resolve().parent]
+    except NameError:
+        base_dirs = []
+    base_dirs.append(Path.cwd())
+
+    for base in base_dirs:
+        for rel in ICON_PNG_SEARCH_DIRS:
+            d = base / rel
+            try:
+                if not d.exists() or not d.is_dir():
+                    continue
+                for child in d.iterdir():
+                    if not child.is_file():
+                        continue
+                    if child.suffix.lower() != ".png":
+                        continue
+                    rel_name = child.name if rel == "" else f"{rel}/{child.name}"
+                    key = rel_name.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    files.append(rel_name)
+            except Exception:
+                continue
+
+    files.sort(key=lambda s: s.lower())
+    return files
 
 
 def _extract_embedded_png_b64(icon_value: str) -> Optional[str]:
@@ -991,6 +1054,14 @@ def get_registry_backend() -> Any:
     token = normalize_text(str(config.get("token", "")))
     owner = normalize_text(str(config.get("owner", "")))
     repo = normalize_text(str(config.get("repo", "")))
+
+    # Fallback por variables de entorno (util en desarrollo local).
+    if not token:
+        token = normalize_text(os.environ.get("GITHUB_TOKEN", "") or os.environ.get("GH_TOKEN", ""))
+    if not owner:
+        owner = normalize_text(os.environ.get("GITHUB_OWNER", ""))
+    if not repo:
+        repo = normalize_text(os.environ.get("GITHUB_REPO", ""))
     branch = normalize_text(str(config.get("branch", "main"))) or "main"
     file_path = normalize_text(str(config.get("path", DEFAULT_GITHUB_REGISTRY_PATH))) or DEFAULT_GITHUB_REGISTRY_PATH
 
@@ -1572,7 +1643,10 @@ def _icon_preview_bytes(icon_value: str) -> Optional[bytes]:
 
 
 def render_icon_picker_new(key_prefix: str = "new_app") -> str:
-    """Selector de icono para 'Nueva app' (emoji / PNG repo / subir PNG)."""
+    """Selector de icono para 'Nueva app' (emoji / PNG repo / subir PNG).
+
+    Nota: Para iconos definitivos, se recomienda "PNG del repositorio" (archivo versionado en GitHub).
+    """
     mode = st.radio(
         "Icono",
         ["Emoji", "PNG del repositorio", "Subir PNG"],
@@ -1590,20 +1664,37 @@ def render_icon_picker_new(key_prefix: str = "new_app") -> str:
         )
 
     if mode == "PNG del repositorio":
-        fname = st.text_input(
-            "Icono (archivo PNG)",
-            placeholder="imagen_01.png",
-            key=f"{key_prefix}_icon_file",
-            help="Debe existir en el repo (mismo folder o /assets, /static, /images o /icons).",
-        )
-        fname = normalize_text(fname)
+        files = list_repo_png_files()
+        manual_opt = "Escribir nombre manualmente..."
+        fname = ""
+
+        if files:
+            sel = st.selectbox(
+                "Seleccionar PNG del repo",
+                options=[manual_opt] + files,
+                key=f"{key_prefix}_icon_repo_select",
+                help="Selecciona un PNG existente del repo o escribe el nombre manualmente.",
+            )
+            if sel != manual_opt:
+                fname = sel
+
+        if not fname:
+            fname = st.text_input(
+                "Icono (archivo PNG)",
+                placeholder="imagen_01.png",
+                key=f"{key_prefix}_icon_file",
+                help="Debe existir en el repo (raiz o /assets, /static, /images, /icons). Tambien acepta rutas como icons/imagen.png.",
+            )
+
+        fname = normalize_text(fname).replace("\\", "/")
         if fname:
             preview = _icon_preview_bytes(f"{ICON_FILE_PREFIX}{fname}")
             if preview:
                 st.image(preview, width=56)
             else:
-                st.caption("No se encontró el PNG. Se mostrará el icono por defecto hasta que exista en el repo.")
+                st.caption("No se encontro el PNG. Se mostrara el icono por defecto hasta que exista en el repo.")
             return f"{ICON_FILE_PREFIX}{fname}"
+
         return DEFAULT_CUSTOM_ICON
 
     # Subir PNG (se guarda embebido en el JSON)
@@ -1612,14 +1703,14 @@ def render_icon_picker_new(key_prefix: str = "new_app") -> str:
         type=["png"],
         accept_multiple_files=False,
         key=f"{key_prefix}_icon_upload",
-        help=f"Se guardará embebido en el registro (recomendado). Máx aprox: {MAX_ICON_BYTES//1000} KB.",
+        help=f"Se guardara embebido en el registro. Para iconos definitivos, usa 'PNG del repositorio'. Max aprox: {MAX_ICON_BYTES//1000} KB.",
     )
     if upload is not None:
         data = upload.getvalue() or b""
         if not data:
             return DEFAULT_CUSTOM_ICON
         if len(data) > MAX_ICON_BYTES:
-            st.error(f"El PNG supera el máximo permitido ({MAX_ICON_BYTES//1000} KB). Reduce el tamaño y vuelve a subirlo.")
+            st.error(f"El PNG supera el maximo permitido ({MAX_ICON_BYTES//1000} KB). Reduce el tamano y vuelve a subirlo.")
             return DEFAULT_CUSTOM_ICON
         st.image(data, width=56)
         b64 = base64.b64encode(data).decode("utf-8")
@@ -1654,20 +1745,37 @@ def render_icon_picker_edit(current_icon: str, key_prefix: str = "edit_app") -> 
         )
 
     if mode == "PNG del repositorio":
-        fname = st.text_input(
-            "Icono (archivo PNG)",
-            placeholder="imagen_01.png",
-            key=f"{key_prefix}_icon_file",
-            help="Debe existir en el repo (mismo folder o /assets, /static, /images o /icons).",
-        )
-        fname = normalize_text(fname)
+        files = list_repo_png_files()
+        manual_opt = "Escribir nombre manualmente..."
+        fname = ""
+
+        if files:
+            sel = st.selectbox(
+                "Seleccionar PNG del repo",
+                options=[manual_opt] + files,
+                key=f"{key_prefix}_icon_repo_select",
+                help="Selecciona un PNG existente del repo o escribe el nombre manualmente.",
+            )
+            if sel != manual_opt:
+                fname = sel
+
+        if not fname:
+            fname = st.text_input(
+                "Icono (archivo PNG)",
+                placeholder="imagen_01.png",
+                key=f"{key_prefix}_icon_file",
+                help="Debe existir en el repo (raiz o /assets, /static, /images, /icons). Tambien acepta rutas como icons/imagen.png.",
+            )
+
+        fname = normalize_text(fname).replace("\\", "/")
         if fname:
             preview = _icon_preview_bytes(f"{ICON_FILE_PREFIX}{fname}")
             if preview:
                 st.image(preview, width=56)
             else:
-                st.caption("No se encontró el PNG. Se mostrará el icono por defecto hasta que exista en el repo.")
+                st.caption("No se encontro el PNG. Se mostrara el icono por defecto hasta que exista en el repo.")
             return f"{ICON_FILE_PREFIX}{fname}"
+
         return DEFAULT_CUSTOM_ICON
 
     # Subir PNG (se guarda embebido en el JSON)
@@ -1676,21 +1784,20 @@ def render_icon_picker_edit(current_icon: str, key_prefix: str = "edit_app") -> 
         type=["png"],
         accept_multiple_files=False,
         key=f"{key_prefix}_icon_upload",
-        help=f"Se guardará embebido en el registro. Máx aprox: {MAX_ICON_BYTES//1000} KB.",
+        help=f"Se guardara embebido en el registro. Para iconos definitivos, usa 'PNG del repositorio'. Max aprox: {MAX_ICON_BYTES//1000} KB.",
     )
     if upload is not None:
         data = upload.getvalue() or b""
         if not data:
             return DEFAULT_CUSTOM_ICON
         if len(data) > MAX_ICON_BYTES:
-            st.error(f"El PNG supera el máximo permitido ({MAX_ICON_BYTES//1000} KB). Reduce el tamaño y vuelve a subirlo.")
+            st.error(f"El PNG supera el maximo permitido ({MAX_ICON_BYTES//1000} KB). Reduce el tamano y vuelve a subirlo.")
             return DEFAULT_CUSTOM_ICON
         st.image(data, width=56)
         b64 = base64.b64encode(data).decode("utf-8")
         return f"{ICON_B64_PREFIX}{b64}"
 
     return DEFAULT_CUSTOM_ICON
-
 
 
 def build_app_from_form(
@@ -1763,8 +1870,6 @@ def persist_updated_app(
     st.session_state.selected_area = updated_app.area
     st.session_state.flash_error = ""
     st.session_state.flash_success = f"La app '{updated_app.title}' fue actualizada correctamente en {backend.info.label}."
-
-
 
 def persist_deleted_app(backend: Any, app_to_delete: AppCard) -> None:
     require_admin_action()
@@ -2018,6 +2123,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
 
 
 
