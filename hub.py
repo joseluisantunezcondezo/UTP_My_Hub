@@ -2,6 +2,10 @@ import base64
 import html
 import json
 import re
+import os
+import time
+import hashlib
+import hmac
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -107,6 +111,30 @@ GITHUB_API_BASE = "https://api.github.com"
 GITHUB_API_VERSION = "2022-11-28"
 
 
+
+
+# ======================================================
+# SEGURIDAD (MODO ADMIN)
+# ======================================================
+
+# Para restringir la gestión (agregar/editar/eliminar) a ti como creador, configura en Streamlit Cloud:
+# [hub_admin]
+# key = "TU_CLAVE_SUPER_SECRETA"
+# ttl_minutes = 240
+# show_panel = false
+#
+# - La UI de administración solo se mostrará si visitas el Hub con ?admin=1 (o si ya activaste la sesión).
+# - Alternativa: usa key_sha256 (hash sha256 en hex) en vez de key.
+
+ADMIN_SECRET_SECTION = "hub_admin"
+ADMIN_KEY_FIELD = "key"
+ADMIN_KEY_SHA256_FIELD = "key_sha256"
+ADMIN_TTL_MIN_FIELD = "ttl_minutes"
+ADMIN_SHOW_PANEL_FIELD = "show_panel"
+ADMIN_QUERY_PARAM = "admin"
+ADMIN_QUERY_VALUE = "1"
+
+DEFAULT_ADMIN_TTL_MINUTES = 240
 # ======================================================
 # MODELOS Y ERRORES DE PERSISTENCIA
 # ======================================================
@@ -767,6 +795,158 @@ def _read_secret_section(section_name: str) -> Dict[str, Any]:
 
 
 
+
+
+def _sha256_hex(value: str) -> str:
+    return hashlib.sha256((value or "").encode("utf-8")).hexdigest()
+
+
+def _get_query_param(name: str) -> str:
+    """Lee un query param de forma compatible con varias versiones de Streamlit."""
+    try:
+        qp = st.query_params
+        val = qp.get(name)
+        if isinstance(val, list):
+            return str(val[0]) if val else ""
+        return str(val) if val is not None else ""
+    except Exception:
+        try:
+            qp = st.experimental_get_query_params()
+            vals = qp.get(name, [])
+            return str(vals[0]) if vals else ""
+        except Exception:
+            return ""
+
+
+def _get_admin_config() -> Dict[str, Any]:
+    cfg = _read_secret_section(ADMIN_SECRET_SECTION)
+
+    key_plain = normalize_text(str(cfg.get(ADMIN_KEY_FIELD, "")))
+    key_hash = normalize_text(str(cfg.get(ADMIN_KEY_SHA256_FIELD, ""))).lower()
+
+    # Fallback por variables de entorno (útil en local)
+    if not key_plain:
+        key_plain = normalize_text(os.environ.get("HUB_ADMIN_KEY", ""))
+    if not key_hash:
+        key_hash = normalize_text(os.environ.get("HUB_ADMIN_KEY_SHA256", "")).lower()
+
+    show_panel = bool(cfg.get(ADMIN_SHOW_PANEL_FIELD, False))
+
+    ttl_minutes = cfg.get(ADMIN_TTL_MIN_FIELD, None)
+    if ttl_minutes is None:
+        ttl_minutes = os.environ.get("HUB_ADMIN_TTL_MIN", "")
+
+    try:
+        ttl_minutes = int(ttl_minutes) if str(ttl_minutes).strip() else DEFAULT_ADMIN_TTL_MINUTES
+    except Exception:
+        ttl_minutes = DEFAULT_ADMIN_TTL_MINUTES
+
+    if ttl_minutes <= 0:
+        ttl_minutes = DEFAULT_ADMIN_TTL_MINUTES
+
+    return {
+        "key_plain": key_plain,
+        "key_hash": key_hash,
+        "ttl_minutes": ttl_minutes,
+        "show_panel": show_panel,
+    }
+
+
+def admin_is_configured() -> bool:
+    cfg = _get_admin_config()
+    return bool(cfg.get("key_plain") or cfg.get("key_hash"))
+
+
+def _admin_session_expired(ttl_minutes: int) -> bool:
+    ts = float(st.session_state.get("admin_ts", 0.0) or 0.0)
+    if not ts:
+        return True
+    return (time.time() - ts) > (ttl_minutes * 60)
+
+
+def admin_is_active() -> bool:
+    cfg = _get_admin_config()
+    if not (cfg.get("key_plain") or cfg.get("key_hash")):
+        return False
+
+    if not bool(st.session_state.get("admin_ok", False)):
+        return False
+
+    if _admin_session_expired(int(cfg.get("ttl_minutes", DEFAULT_ADMIN_TTL_MINUTES))):
+        st.session_state.admin_ok = False
+        return False
+
+    return True
+
+
+def _verify_admin_key(user_key: str) -> bool:
+    user_key = (user_key or "").strip()
+    if not user_key:
+        return False
+
+    cfg = _get_admin_config()
+    key_plain = cfg.get("key_plain", "")
+    key_hash = cfg.get("key_hash", "")
+
+    if key_plain:
+        return hmac.compare_digest(user_key, key_plain)
+
+    if key_hash:
+        return hmac.compare_digest(_sha256_hex(user_key), key_hash)
+
+    return False
+
+
+def require_admin_action() -> None:
+    if not admin_is_active():
+        raise RegistryError("Acceso restringido. Activa el modo administrador para gestionar apps.")
+
+
+def render_admin_panel() -> None:
+    """Panel de administración en el sidebar.
+
+    Para que NO se muestre a otros usuarios, por defecto solo aparece si visitas el hub con ?admin=1
+    (o si ya activaste la sesión admin).
+    """
+    cfg = _get_admin_config()
+
+    show = bool(cfg.get("show_panel")) or admin_is_active() or (_get_query_param(ADMIN_QUERY_PARAM) == ADMIN_QUERY_VALUE)
+    if not show:
+        return
+
+    st.markdown('<div class="hub-sidebar-label">Administrador</div>', unsafe_allow_html=True)
+
+    if not admin_is_configured():
+        st.info("Configura st.secrets [hub_admin] para habilitar la gestión (key o key_sha256).")
+        return
+
+    if admin_is_active():
+        st.success("Modo administrador activo")
+        if st.button("Cerrar sesión", use_container_width=True, key="admin_logout_btn"):
+            st.session_state.admin_ok = False
+            st.session_state.admin_ts = 0.0
+            st.rerun()
+        return
+
+    key = st.text_input("Clave", type="password", key="admin_key_input")
+    col_a, col_b = st.columns([1, 1])
+    activar = col_a.button("Activar", use_container_width=True, type="primary", key="admin_login_btn")
+    limpiar = col_b.button("Limpiar", use_container_width=True, key="admin_clear_btn")
+
+    if limpiar:
+        st.session_state.admin_key_input = ""
+        st.rerun()
+
+    if activar:
+        if _verify_admin_key(key):
+            st.session_state.admin_ok = True
+            st.session_state.admin_ts = time.time()
+            st.session_state.admin_key_input = ""
+            st.rerun()
+        else:
+            st.error("Clave incorrecta.")
+
+
 def get_registry_backend() -> Any:
     config = _read_secret_section("github_registry")
 
@@ -1131,6 +1311,11 @@ def init_state() -> None:
     if "flash_error" not in st.session_state:
         st.session_state.flash_error = ""
 
+    if "admin_ok" not in st.session_state:
+        st.session_state.admin_ok = False
+    if "admin_ts" not in st.session_state:
+        st.session_state.admin_ts = 0.0
+
 
 
 def set_area(area_name: str) -> None:
@@ -1151,8 +1336,6 @@ def sidebar_area_button(area_name: str, icon: str) -> None:
         on_click=set_area,
         args=(area_name,),
     )
-
-
 
 
 def render_sidebar(areas: List[Dict[str, str]], backend_info: RegistryBackendInfo) -> str:
@@ -1201,11 +1384,12 @@ def render_sidebar(areas: List[Dict[str, str]], backend_info: RegistryBackendInf
             """,
             unsafe_allow_html=True,
         )
+        # Panel administrador (por defecto solo visible con ?admin=1)
+        render_admin_panel()
+
 
         st.markdown("</div>", unsafe_allow_html=True)
     return search_term.strip().lower()
-
-
 
 def filter_apps(apps: List[AppCard], selected_area: str, search_term: str) -> List[AppCard]:
     items = [app for app in apps if app.area == selected_area]
@@ -1218,8 +1402,6 @@ def filter_apps(apps: List[AppCard], selected_area: str, search_term: str) -> Li
         if search_term in haystack:
             filtered.append(app)
     return filtered
-
-
 
 def render_header(selected_area: str, app_count: int, search_term: str) -> None:
     st.markdown(
@@ -1265,7 +1447,10 @@ def render_card(app: AppCard) -> None:
     )
 
 
-def render_add_new_button(button_key: str) -> bool:
+def render_add_new_button(button_key: str, enabled: bool) -> bool:
+    if not enabled:
+        return False
+
     open_dialog = st.button(
         "AÑADIR NUEVA APP",
         key=button_key,
@@ -1274,9 +1459,9 @@ def render_add_new_button(button_key: str) -> bool:
     )
     return open_dialog
 
-def render_apps_grid(apps: List[AppCard]) -> bool:
+def render_apps_grid(apps: List[AppCard], enabled: bool) -> bool:
     open_dialog = False
-    total_slots = len(apps) + 1
+    total_slots = len(apps) + (1 if enabled else 0)
 
     for row_start in range(0, total_slots, 3):
         cols = st.columns(3, gap="large")
@@ -1288,8 +1473,8 @@ def render_apps_grid(apps: List[AppCard]) -> bool:
             with cols[col_idx]:
                 if slot_idx < len(apps):
                     render_card(apps[slot_idx])
-                elif slot_idx == len(apps):
-                    if render_add_new_button("open_add_app_form_slot"):
+                elif enabled and slot_idx == len(apps):
+                    if render_add_new_button("open_add_app_form_slot", enabled=True):
                         open_dialog = True
 
     return open_dialog
@@ -1457,7 +1642,6 @@ def render_icon_picker_edit(current_icon: str, key_prefix: str = "edit_app") -> 
 
     return DEFAULT_CUSTOM_ICON
 
-
 def build_app_from_form(
     title: str,
     area: str,
@@ -1495,6 +1679,8 @@ def persist_new_app(
     url: str,
     icon: str,
 ) -> None:
+    require_admin_action()
+
     new_app = build_app_from_form(title, area, description, url, icon)
 
     if app_exists(all_apps, new_app.title, new_app.url):
@@ -1515,6 +1701,8 @@ def persist_updated_app(
     url: str,
     icon: str,
 ) -> None:
+    require_admin_action()
+
     updated_app = build_app_from_form(title, area, description, url, icon)
 
     if app_exists_excluding(all_apps, updated_app.title, updated_app.url, original_app.title, original_app.url):
@@ -1525,10 +1713,16 @@ def persist_updated_app(
     st.session_state.flash_error = ""
     st.session_state.flash_success = f"La app '{updated_app.title}' fue actualizada correctamente en {backend.info.label}."
 
+
+
 def persist_deleted_app(backend: Any, app_to_delete: AppCard) -> None:
+    require_admin_action()
+
     backend.delete_app(app_to_delete.title, app_to_delete.url)
     st.session_state.flash_error = ""
     st.session_state.flash_success = f"La app '{app_to_delete.title}' fue eliminada correctamente de {backend.info.label}."
+
+
 
 def render_registry_edit_tab(backend: Any, all_apps: List[AppCard], registry_apps: List[AppCard]) -> None:
     """Edición de apps registradas.
@@ -1593,6 +1787,7 @@ def render_registry_edit_tab(backend: Any, all_apps: List[AppCard], registry_app
         else:
             st.rerun()
 
+
 def render_registry_delete_tab(backend: Any, registry_apps: List[AppCard]) -> None:
     if not registry_apps:
         st.info("No hay apps registradas para eliminar. Las apps fijas del código no se eliminan desde este modal.")
@@ -1642,6 +1837,7 @@ if DIALOG_DECORATOR is not None:
 
     @DIALOG_DECORATOR("Gestionar apps", width="large")
     def show_add_app_dialog(backend: Any, all_apps: List[AppCard]) -> None:
+        require_admin_action()
         registry_apps = backend.load_apps()
         st.caption("Desde este modal puedes registrar, editar y eliminar apps persistidas. Las apps fijas del código permanecen protegidas.")
 
@@ -1692,6 +1888,7 @@ if DIALOG_DECORATOR is not None:
 else:
 
     def show_add_app_dialog(backend: Any, all_apps: List[AppCard]) -> None:
+        require_admin_action()
         registry_apps = backend.load_apps()
         st.warning("Tu versión de Streamlit no soporta st.dialog. Actualiza Streamlit para usar el modal emergente.")
         tab_new, tab_edit, tab_delete = st.tabs(["Nueva app", "Editar app", "Eliminar app"])
@@ -1759,14 +1956,19 @@ def main() -> None:
 
     if not visible_apps:
         render_empty_state()
-        open_dialog = render_add_new_button("open_add_app_form_empty_top")
+        open_dialog = render_add_new_button("open_add_app_form_empty_top", enabled=admin_is_active())
     else:
-        open_dialog = render_apps_grid(visible_apps)
+        open_dialog = render_apps_grid(visible_apps, enabled=admin_is_active())
 
     if open_dialog:
-        show_add_app_dialog(backend, all_apps)
+        if not admin_is_active():
+            st.session_state.flash_error = "Acceso restringido. Activa el modo administrador para gestionar apps."
+        else:
+            show_add_app_dialog(backend, all_apps)
 
 if __name__ == "__main__":
     main()
+
+
 
 
