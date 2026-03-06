@@ -902,15 +902,48 @@ def require_admin_action() -> None:
         raise RegistryError("Acceso restringido. Activa el modo administrador para gestionar apps.")
 
 
+def _admin_clear_input() -> None:
+    # Para widgets (admin_key_input), la asignación debe ocurrir antes
+    # de que el widget se cree en el próximo rerun (usando on_click).
+    st.session_state["admin_key_input"] = ""
+    st.session_state["admin_login_error"] = ""
+
+
+def _admin_logout() -> None:
+    st.session_state["admin_ok"] = False
+    st.session_state["admin_ts"] = 0.0
+    st.session_state["admin_key_input"] = ""
+    st.session_state["admin_login_error"] = ""
+
+
+def _admin_login_action() -> None:
+    key = str(st.session_state.get("admin_key_input", "") or "").strip()
+    if _verify_admin_key(key):
+        st.session_state["admin_ok"] = True
+        st.session_state["admin_ts"] = time.time()
+        st.session_state["admin_login_error"] = ""
+        st.session_state["admin_key_input"] = ""
+    else:
+        st.session_state["admin_ok"] = False
+        st.session_state["admin_ts"] = 0.0
+        st.session_state["admin_login_error"] = "Clave incorrecta."
+
+
 def render_admin_panel() -> None:
     """Panel de administración en el sidebar.
 
-    Para que NO se muestre a otros usuarios, por defecto solo aparece si visitas el hub con ?admin=1
-    (o si ya activaste la sesión admin).
+    Fix robusto: Limpiar/Activar ahora usan callbacks (on_click). Así evitamos
+    el StreamlitAPIException que ocurre cuando se intenta asignar a
+    st.session_state[<key_de_widget>] después de crear el widget en el mismo rerun.
+
+    Para que NO se muestre a otros usuarios, por defecto solo aparece si visitas
+    el hub con ?admin=1 (o si ya activaste la sesión admin).
     """
     cfg = _get_admin_config()
 
-    show = bool(cfg.get("show_panel")) or admin_is_active() or (_get_query_param(ADMIN_QUERY_PARAM) == ADMIN_QUERY_VALUE)
+    show = bool(cfg.get("show_panel")) or admin_is_active() or (
+        _get_query_param(ADMIN_QUERY_PARAM) == ADMIN_QUERY_VALUE
+    )
     if not show:
         return
 
@@ -922,29 +955,34 @@ def render_admin_panel() -> None:
 
     if admin_is_active():
         st.success("Modo administrador activo")
-        if st.button("Cerrar sesión", use_container_width=True, key="admin_logout_btn"):
-            st.session_state.admin_ok = False
-            st.session_state.admin_ts = 0.0
-            st.rerun()
+        st.button(
+            "Cerrar sesión",
+            use_container_width=True,
+            key="admin_logout_btn",
+            on_click=_admin_logout,
+        )
         return
 
-    key = st.text_input("Clave", type="password", key="admin_key_input")
+    st.text_input("Clave", type="password", key="admin_key_input")
+
     col_a, col_b = st.columns([1, 1])
-    activar = col_a.button("Activar", use_container_width=True, type="primary", key="admin_login_btn")
-    limpiar = col_b.button("Limpiar", use_container_width=True, key="admin_clear_btn")
+    col_a.button(
+        "Activar",
+        use_container_width=True,
+        type="primary",
+        key="admin_login_btn",
+        on_click=_admin_login_action,
+    )
+    col_b.button(
+        "Limpiar",
+        use_container_width=True,
+        key="admin_clear_btn",
+        on_click=_admin_clear_input,
+    )
 
-    if limpiar:
-        st.session_state.admin_key_input = ""
-        st.rerun()
-
-    if activar:
-        if _verify_admin_key(key):
-            st.session_state.admin_ok = True
-            st.session_state.admin_ts = time.time()
-            st.session_state.admin_key_input = ""
-            st.rerun()
-        else:
-            st.error("Clave incorrecta.")
+    err = str(st.session_state.get("admin_login_error", "") or "").strip()
+    if err:
+        st.error(err)
 
 
 def get_registry_backend() -> Any:
@@ -1316,6 +1354,11 @@ def init_state() -> None:
     if "admin_ts" not in st.session_state:
         st.session_state.admin_ts = 0.0
 
+    if "admin_key_input" not in st.session_state:
+        st.session_state.admin_key_input = ""
+    if "admin_login_error" not in st.session_state:
+        st.session_state.admin_login_error = ""
+
 
 
 def set_area(area_name: str) -> None:
@@ -1336,6 +1379,8 @@ def sidebar_area_button(area_name: str, icon: str) -> None:
         on_click=set_area,
         args=(area_name,),
     )
+
+
 
 
 def render_sidebar(areas: List[Dict[str, str]], backend_info: RegistryBackendInfo) -> str:
@@ -1391,6 +1436,8 @@ def render_sidebar(areas: List[Dict[str, str]], backend_info: RegistryBackendInf
         st.markdown("</div>", unsafe_allow_html=True)
     return search_term.strip().lower()
 
+
+
 def filter_apps(apps: List[AppCard], selected_area: str, search_term: str) -> List[AppCard]:
     items = [app for app in apps if app.area == selected_area]
     if not search_term:
@@ -1402,6 +1449,8 @@ def filter_apps(apps: List[AppCard], selected_area: str, search_term: str) -> Li
         if search_term in haystack:
             filtered.append(app)
     return filtered
+
+
 
 def render_header(selected_area: str, app_count: int, search_term: str) -> None:
     st.markdown(
@@ -1642,6 +1691,8 @@ def render_icon_picker_edit(current_icon: str, key_prefix: str = "edit_app") -> 
 
     return DEFAULT_CUSTOM_ICON
 
+
+
 def build_app_from_form(
     title: str,
     area: str,
@@ -1721,7 +1772,6 @@ def persist_deleted_app(backend: Any, app_to_delete: AppCard) -> None:
     backend.delete_app(app_to_delete.title, app_to_delete.url)
     st.session_state.flash_error = ""
     st.session_state.flash_success = f"La app '{app_to_delete.title}' fue eliminada correctamente de {backend.info.label}."
-
 
 
 def render_registry_edit_tab(backend: Any, all_apps: List[AppCard], registry_apps: List[AppCard]) -> None:
@@ -1968,6 +2018,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
 
 
 
