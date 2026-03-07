@@ -1,7 +1,7 @@
 {
   "apps": [
     {
-      "title": "Descarga masiva H5P_Rise (En desarrollo....)",
+      "title": "Descarga masiva H5P_Rise (En curso....)",
       "description": "Automatiza la descarga masiva de contenidos H5P y de archivos XLIFF desde Rise.",
       "source_file": "apps_registry.json",
       "url": "https://descarga-masiva-h5p-rise-joseluisantunezcondezo.streamlit.app/",
